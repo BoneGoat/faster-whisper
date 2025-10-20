@@ -139,7 +139,10 @@ def format_timestamp(
     always_include_hours: bool = False,
     decimal_marker: str = ".",
 ) -> str:
-    assert seconds >= 0, "non-negative timestamp expected"
+    if seconds < 0:
+        logger = get_logger()
+        logger.warning("non-negative timestamp expected")
+        return str(seconds)
     milliseconds = round(seconds * 1000.0)
 
     hours = milliseconds // 3_600_000
