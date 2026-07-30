@@ -336,9 +336,11 @@ class _RecordingModel:
 
     def __init__(self):
         self.align_calls = 0
+        self.num_frames_seen = []
 
-    def align(self, *args, **kwargs):
+    def align(self, features, start_sequence, text_tokens, num_frames, **kwargs):
         self.align_calls += 1
+        self.num_frames_seen.append(num_frames)
         return []
 
 
@@ -352,41 +354,23 @@ class _StubWhisper:
 
 
 def test_find_alignment_skips_empty_token_batch():
-    # text_tokens is List[List[int]], so [[]] has len 1 and passes the batch-size guard.
-    # Combined with the single-frame window such a segment produces, reaching model.align()
-    # faulted on CUDA ("parallel_for failed: cudaErrorInvalidDevice").
+    # text_tokens is List[List[int]], so [[]] has len 1 and slips past the batch-size guard.
+    # There is nothing to align, so align() must not be called at all.
     stub = _StubWhisper()
 
     alignments = WhisperModel.find_alignment(
-        stub, tokenizer=None, text_tokens=[[]], encoder_output=None, num_frames=1
+        stub, tokenizer=_StubTokenizer(), text_tokens=[[]], encoder_output=None, num_frames=1
     )
 
-    assert stub.model.align_calls == 0, "align() must not run when there is nothing to align"
+    assert stub.model.align_calls == 0
     # One entry per batch element, not a bare []: add_word_timestamps indexes
     # alignments[segment_idx] and median_max_durations[segment_idx].
     assert alignments == [[]]
 
 
-def test_find_alignment_skips_single_frame_window():
-    # The real production trigger: align() faults with
-    # "parallel_for failed: cudaErrorInvalidDevice" when num_frames is exactly 1, even
-    # with tokens present. Measured on an A40: 1 fails, 2/3/5/6/7/10/100/3000 all pass.
-    stub = _StubWhisper()
-
-    alignments = WhisperModel.find_alignment(
-        stub,
-        tokenizer=_StubTokenizer(),
-        text_tokens=[[123, 456]],
-        encoder_output=None,
-        num_frames=1,
-    )
-
-    assert stub.model.align_calls == 0, "align() must not run on a single-frame window"
-    assert alignments == [[]]
-
-
-def test_find_alignment_aligns_from_two_frames_up():
-    # 2 is the first width that works, so the guard must not be over-broad.
+def test_find_alignment_clamps_single_frame_window_int():
+    # Sequential path (generate_segments) passes an int. num_frames=1 faults on CUDA with
+    # "parallel_for failed: cudaErrorInvalidDevice"; 2 and above are fine.
     stub = _StubWhisper()
 
     WhisperModel.find_alignment(
@@ -394,10 +378,43 @@ def test_find_alignment_aligns_from_two_frames_up():
         tokenizer=_StubTokenizer(),
         text_tokens=[[123, 456]],
         encoder_output=None,
-        num_frames=2,
+        num_frames=1,
     )
 
-    assert stub.model.align_calls == 1
+    assert stub.model.num_frames_seen == [2]
+
+
+def test_find_alignment_clamps_single_frame_window_list():
+    # BatchedInferencePipeline passes a per-batch LIST (segment_sizes), not an int. Guarding
+    # only the scalar shape raised "'<' not supported between instances of 'list' and 'int'"
+    # in production on every batched job.
+    stub = _StubWhisper()
+
+    WhisperModel.find_alignment(
+        stub,
+        tokenizer=_StubTokenizer(),
+        text_tokens=[[123], [456], [789]],
+        encoder_output=None,
+        num_frames=[1, 0, 3000],
+    )
+
+    # Degenerate entries lifted to 2; healthy ones untouched, so a mixed batch keeps its
+    # word timestamps instead of losing them wholesale.
+    assert stub.model.num_frames_seen == [[2, 2, 3000]]
+
+
+def test_find_alignment_leaves_normal_windows_alone():
+    # The guard must not perturb ordinary input, in either shape.
+    for num_frames, expected in ((3000, 3000), ([3000, 1500], [3000, 1500])):
+        stub = _StubWhisper()
+        WhisperModel.find_alignment(
+            stub,
+            tokenizer=_StubTokenizer(),
+            text_tokens=[[123, 456]] * (len(expected) if isinstance(expected, list) else 1),
+            encoder_output=None,
+            num_frames=num_frames,
+        )
+        assert stub.model.num_frames_seen == [expected]
 
 
 def test_find_alignment_still_aligns_when_tokens_present():

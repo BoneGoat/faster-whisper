@@ -1715,28 +1715,35 @@ class WhisperModel:
         if len(text_tokens) == 0:
             return []
 
-        # Two degenerate inputs must not reach model.align():
-        #
-        # 1. num_frames == 1. This faults on CUDA with
-        #    "parallel_for failed: cudaErrorInvalidDevice: invalid device ordinal".
-        #    Measured on an A40 by calling align() directly with real encoder output and
-        #    non-empty tokens: num_frames=1 fails, and 2, 3, 5, 6, 7, 10, 100 and 3000 all
-        #    pass -- so the cliff is at exactly 1, not at median_filter_width. The CPU
-        #    backend tolerates it, which is why this only ever appeared in production. One
-        #    encoder frame is 20 ms of audio, so there is nothing to align regardless.
-        #    (< 2 rather than == 1 so a 0 or negative window is covered too; segment_size is
-        #    a min() over clip bounds and can in principle go non-positive.)
-        #
-        # 2. Every sequence empty. text_tokens is List[List[int]], so the len() check above
-        #    only tests the batch size: a token-less segment arrives as [[]], len 1, and
-        #    slips through. Nothing to align.
-        #
-        # Return one empty alignment PER BATCH ENTRY rather than a bare []:
+        # Nothing to align. text_tokens is List[List[int]], so the len() check above only
+        # tests the batch size: a token-less segment arrives as [[]], len 1, and slips
+        # through. Return one empty alignment PER BATCH ENTRY rather than a bare [], because
         # add_word_timestamps indexes alignments[segment_idx] and
-        # median_max_durations[segment_idx], so a bare [] would swap the CUDA fault for an
-        # IndexError. all() not any(): a mixed batch still has real work and must reach align().
-        if num_frames < 2 or all(len(tokens) == 0 for tokens in text_tokens):
+        # median_max_durations[segment_idx] -- a bare [] would raise IndexError. all() not
+        # any(): a mixed batch still has real work and must reach align().
+        if all(len(tokens) == 0 for tokens in text_tokens):
             return [[] for _ in text_tokens]
+
+        # model.align() faults on CUDA with "parallel_for failed: cudaErrorInvalidDevice:
+        # invalid device ordinal" when a window is a single frame. Measured on an A40 with
+        # real encoder output and non-empty tokens: num_frames=1 fails, while 2, 3, 5, 6, 7,
+        # 10, 100 and 3000 all pass -- the cliff is at exactly 1, not at median_filter_width.
+        # The CPU backend tolerates it, which is why it only ever appeared in production.
+        #
+        # num_frames is an int on the sequential path (generate_segments passes segment_size)
+        # but a per-batch LIST from BatchedInferencePipeline (which passes segment_sizes), so
+        # both shapes have to be handled -- CTranslate2 accepts Union[int, List[int]].
+        #
+        # Clamp rather than skip: one encoder frame is 20 ms, so aligning over two frames --
+        # the second being encoder padding -- costs nothing measurable, and it preserves word
+        # timestamps for every batch element. Skipping would drop them for the healthy
+        # elements of a mixed batch. max() also covers a zero or negative window, which
+        # segment_size can in principle reach since it is a min() over clip bounds.
+        min_align_frames = 2
+        if isinstance(num_frames, (list, tuple)):
+            num_frames = [max(int(n), min_align_frames) for n in num_frames]
+        else:
+            num_frames = max(int(num_frames), min_align_frames)
 
         results = self.model.align(
             encoder_output,
