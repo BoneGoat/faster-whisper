@@ -1715,6 +1715,20 @@ class WhisperModel:
         if len(text_tokens) == 0:
             return []
 
+        # text_tokens is List[List[int]], so the check above only tests the batch size, not
+        # whether there is anything to align. A segment that yields no tokens arrives here as
+        # [[]] -- len() 1, so it slips through -- and the trailing window such a segment
+        # produces can be a single frame. Passing that to model.align() faults on CUDA with
+        # "parallel_for failed: cudaErrorInvalidDevice"; the CPU backend tolerates it, which is
+        # why this only ever showed up in production.
+        #
+        # Return one empty alignment PER BATCH ENTRY rather than a bare []:
+        # add_word_timestamps indexes alignments[segment_idx] and
+        # median_max_durations[segment_idx], so a bare [] would swap the CUDA fault for an
+        # IndexError. all() not any(): a mixed batch still has real work and must reach align().
+        if all(len(tokens) == 0 for tokens in text_tokens):
+            return [[] for _ in text_tokens]
+
         results = self.model.align(
             encoder_output,
             tokenizer.sot_sequence,

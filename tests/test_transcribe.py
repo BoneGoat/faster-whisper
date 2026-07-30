@@ -329,3 +329,54 @@ def test_cliptimestamps_timings(physcisworks_path):
         assert clip["start"] == segment.start
         assert clip["end"] == segment.end
         assert segment.text == transcript
+
+
+class _RecordingModel:
+    """Stands in for the CTranslate2 model so these tests need no weights and no GPU."""
+
+    def __init__(self):
+        self.align_calls = 0
+
+    def align(self, *args, **kwargs):
+        self.align_calls += 1
+        return []
+
+
+class _StubTokenizer:
+    sot_sequence = [50258, 50259, 50360]
+
+
+class _StubWhisper:
+    def __init__(self):
+        self.model = _RecordingModel()
+
+
+def test_find_alignment_skips_empty_token_batch():
+    # text_tokens is List[List[int]], so [[]] has len 1 and passes the batch-size guard.
+    # Combined with the single-frame window such a segment produces, reaching model.align()
+    # faulted on CUDA ("parallel_for failed: cudaErrorInvalidDevice").
+    stub = _StubWhisper()
+
+    alignments = WhisperModel.find_alignment(
+        stub, tokenizer=None, text_tokens=[[]], encoder_output=None, num_frames=1
+    )
+
+    assert stub.model.align_calls == 0, "align() must not run when there is nothing to align"
+    # One entry per batch element, not a bare []: add_word_timestamps indexes
+    # alignments[segment_idx] and median_max_durations[segment_idx].
+    assert alignments == [[]]
+
+
+def test_find_alignment_still_aligns_when_tokens_present():
+    # Guard must not swallow batches that have real work, including mixed ones.
+    stub = _StubWhisper()
+
+    WhisperModel.find_alignment(
+        stub,
+        tokenizer=_StubTokenizer(),
+        text_tokens=[[], [123]],
+        encoder_output=None,
+        num_frames=3000,
+    )
+
+    assert stub.model.align_calls == 1
