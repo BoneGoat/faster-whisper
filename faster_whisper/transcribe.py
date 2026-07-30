@@ -1715,18 +1715,27 @@ class WhisperModel:
         if len(text_tokens) == 0:
             return []
 
-        # text_tokens is List[List[int]], so the check above only tests the batch size, not
-        # whether there is anything to align. A segment that yields no tokens arrives here as
-        # [[]] -- len() 1, so it slips through -- and the trailing window such a segment
-        # produces can be a single frame. Passing that to model.align() faults on CUDA with
-        # "parallel_for failed: cudaErrorInvalidDevice"; the CPU backend tolerates it, which is
-        # why this only ever showed up in production.
+        # Two degenerate inputs must not reach model.align():
+        #
+        # 1. num_frames == 1. This faults on CUDA with
+        #    "parallel_for failed: cudaErrorInvalidDevice: invalid device ordinal".
+        #    Measured on an A40 by calling align() directly with real encoder output and
+        #    non-empty tokens: num_frames=1 fails, and 2, 3, 5, 6, 7, 10, 100 and 3000 all
+        #    pass -- so the cliff is at exactly 1, not at median_filter_width. The CPU
+        #    backend tolerates it, which is why this only ever appeared in production. One
+        #    encoder frame is 20 ms of audio, so there is nothing to align regardless.
+        #    (< 2 rather than == 1 so a 0 or negative window is covered too; segment_size is
+        #    a min() over clip bounds and can in principle go non-positive.)
+        #
+        # 2. Every sequence empty. text_tokens is List[List[int]], so the len() check above
+        #    only tests the batch size: a token-less segment arrives as [[]], len 1, and
+        #    slips through. Nothing to align.
         #
         # Return one empty alignment PER BATCH ENTRY rather than a bare []:
         # add_word_timestamps indexes alignments[segment_idx] and
         # median_max_durations[segment_idx], so a bare [] would swap the CUDA fault for an
         # IndexError. all() not any(): a mixed batch still has real work and must reach align().
-        if all(len(tokens) == 0 for tokens in text_tokens):
+        if num_frames < 2 or all(len(tokens) == 0 for tokens in text_tokens):
             return [[] for _ in text_tokens]
 
         results = self.model.align(

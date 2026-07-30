@@ -367,6 +367,39 @@ def test_find_alignment_skips_empty_token_batch():
     assert alignments == [[]]
 
 
+def test_find_alignment_skips_single_frame_window():
+    # The real production trigger: align() faults with
+    # "parallel_for failed: cudaErrorInvalidDevice" when num_frames is exactly 1, even
+    # with tokens present. Measured on an A40: 1 fails, 2/3/5/6/7/10/100/3000 all pass.
+    stub = _StubWhisper()
+
+    alignments = WhisperModel.find_alignment(
+        stub,
+        tokenizer=_StubTokenizer(),
+        text_tokens=[[123, 456]],
+        encoder_output=None,
+        num_frames=1,
+    )
+
+    assert stub.model.align_calls == 0, "align() must not run on a single-frame window"
+    assert alignments == [[]]
+
+
+def test_find_alignment_aligns_from_two_frames_up():
+    # 2 is the first width that works, so the guard must not be over-broad.
+    stub = _StubWhisper()
+
+    WhisperModel.find_alignment(
+        stub,
+        tokenizer=_StubTokenizer(),
+        text_tokens=[[123, 456]],
+        encoder_output=None,
+        num_frames=2,
+    )
+
+    assert stub.model.align_calls == 1
+
+
 def test_find_alignment_still_aligns_when_tokens_present():
     # Guard must not swallow batches that have real work, including mixed ones.
     stub = _StubWhisper()
